@@ -1,200 +1,198 @@
 """
-The most atomic way to train and run inference for a GPT in pure, dependency-free Python.
-This file is the complete algorithm.
-Everything else is just efficiency.
+«La manera más atómica de entrenar e inferir un GPT en Python puro e independiente.
+Este archivo contiene el algoritmo completo.
+El resto es mera eficiencia.»
 
 @karpathy
 """
 
-import os       # os.path.exists
-import math     # math.log, math.exp
-import random   # random.seed, random.choices, random.gauss, random.shuffle
-random.seed(42) # Let there be order among chaos
+import os       # Verificar si existe el archivo de entrada mediante os.path.exists
+import math     # Funciones logarítmicas y potencias mediante math.log, math.exp
+import random   # Funciones aleatorias mediante random.seed, random.choices, random.gauss, random.shuffle
+random.seed(42) # Iniciar el programa en un estado reproducible
 
-# Let there be a Dataset `docs`: list[str] of documents (e.g. a list of names)
-if not os.path.exists('input.txt'):
+archivo = "nombres.txt"
+# Conjunto de datos de entrada: lista de «documentos» (tal como un conjunto de nombres)
+if not os.path.exists(archivo):
     import urllib.request
-    names_url = 'https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt'
-    urllib.request.urlretrieve(names_url, 'input.txt')
-docs = [line.strip() for line in open('input.txt') if line.strip()]
-random.shuffle(docs)
-print(f"num docs: {len(docs)}")
+    nombres_direccion = 'https://raw.githubusercontent.com/mgcamacho/microgpt/prima/nombres.txt'
+    urllib.request.urlretrieve(nombres_direccion, archivo)
+documentos = [linea.strip() for linea in open(archivo, encoding="latin1").read().strip().split('\n') if linea.strip()] # lista[str] de documentos
+random.shuffle(documentos)
+print(f"cantidad docs: {len(documentos)}")
 
-# Let there be a Tokenizer to translate strings to sequences of integers ("tokens") and back
-uchars = sorted(set(''.join(docs))) # unique characters in the dataset become token ids 0..n-1
-BOS = len(uchars) # token id for a special Beginning of Sequence (BOS) token
-vocab_size = len(uchars) + 1 # total number of unique tokens, +1 is for BOS
-print(f"vocab size: {vocab_size}")
+# Fichador que traduce cadenas de texto a secuencias de enteros («fichas») y viceversa
+caracteres_unicos = sorted(set(''.join(documentos))) # Los distintos caracteres en el conjunto son transformados en fichas 0..n-1
+PDS = len(caracteres_unicos) # Identificador de la ficha especial de principio de secuencia (PDS)
+long_vocab = len(caracteres_unicos) + 1 # Cantidad total de fichas únicas, +1 para el PDS
+print(f"tamaño del vocabulario: {long_vocab}")
 
-# Let there be Autograd to recursively apply the chain rule through a computation graph
-class Value:
-    __slots__ = ('data', 'grad', '_children', '_local_grads') # Python optimization for memory usage
+# Autogradiente para aplicar de forma recursiva la regla de la cadena a través de un grafo de cómputo
+class Valor:
+    __slots__ = ('dato', 'gradiente', '_hijos', '_grads_locales') # Optimización para el uso de memoria
 
-    def __init__(self, data, children=(), local_grads=()):
-        self.data = data                # scalar value of this node calculated during forward pass
-        self.grad = 0                   # derivative of the loss w.r.t. this node, calculated in backward pass
-        self._children = children       # children of this node in the computation graph
-        self._local_grads = local_grads # local derivative of this node w.r.t. its children
+    def __init__(auto, dato, hijos=(), grads_locales=()):
+        auto.dato = dato                    # Valor escalar de este nodo (auto) calculado durante la propagación
+        auto.gradiente = 0                  # Derivada de la pérdida con respecto a este nodo, calculada en la retropropagación
+        auto._hijos = hijos                 # Hijos de este nodo en el grafo de cómputo
+        auto._grads_locales = grads_locales # Derivada local de este nodo con respecto a sus hijos
 
-    def __add__(self, other):
-        other = other if isinstance(other, Value) else Value(other)
-        return Value(self.data + other.data, (self, other), (1, 1))
+    def __add__(auto, otro):
+        otro = otro if isinstance(otro, Valor) else Valor(otro) # Si otro nodo es un objeto Valor, convertir en uno (ej: 5 -> Valor(5))
+        return Valor(auto.dato + otro.dato, (auto, otro), (1, 1))
 
-    def __mul__(self, other):
-        other = other if isinstance(other, Value) else Value(other)
-        return Value(self.data * other.data, (self, other), (other.data, self.data))
+    def __mul__(auto, otro):
+        otro = otro if isinstance(otro, Valor) else Valor(otro) # Garantizar que ambos operandos sean objetos Valor
+        return Valor(auto.dato * otro.dato, (auto, otro), (otro.dato, auto.dato))
+    
+    # Operadores derivados
+    def __pow__(auto, exponente): return Valor(auto.dato**exponente, (auto,), (exponente * auto.dato**(exponente-1),)) # Exponenciación
+    def log(auto): return Valor(math.log(auto.dato), (auto,), (1/auto.dato,)) # Logaritmo natural
+    def exp(auto): return Valor(math.exp(auto.dato), (auto,), (math.exp(auto.dato),)) # Exponencial
+    def relu(auto): return Valor(max(0, auto.dato), (auto,), (float(auto.dato > 0),)) # Unidad lineal rectificada
+    def __neg__(auto): return auto * -1 # Negación unaria
+    def __radd__(auto, otro): return auto + otro # Suma con operando invertido (derecha)
+    def __sub__(auto, otro): return auto + (-otro) # Resta
+    def __rsub__(auto, otro): return otro + (-auto) # Resta con operando invertido
+    def __rmul__(auto, otro): return auto * otro # Multiplicación con operando invertido
+    def __truediv__(auto, otro): return auto * otro**-1 # División
+    def __rtruediv__(auto, otro): return otro * auto**-1 # División con operando invertido
 
-    def __pow__(self, other): return Value(self.data**other, (self,), (other * self.data**(other-1),))
-    def log(self): return Value(math.log(self.data), (self,), (1/self.data,))
-    def exp(self): return Value(math.exp(self.data), (self,), (math.exp(self.data),))
-    def relu(self): return Value(max(0, self.data), (self,), (float(self.data > 0),))
-    def __neg__(self): return self * -1
-    def __radd__(self, other): return self + other
-    def __sub__(self, other): return self + (-other)
-    def __rsub__(self, other): return other + (-self)
-    def __rmul__(self, other): return self * other
-    def __truediv__(self, other): return self * other**-1
-    def __rtruediv__(self, other): return other * self**-1
+    def propagar(auto):
+        orden_topologico = []
+        visitados = set()
+        def construir_orden(v):
+            if v not in visitados:
+                visitados.add(v)
+                for hijo in v._hijos:
+                    construir_orden(hijo)
+                orden_topologico.append(v)
+        construir_orden(auto)
+        auto.gradiente = 1
+        for v in reversed(orden_topologico):
+            for hijo, grad_local in zip(v._hijos, v._grads_locales):
+                hijo.gradiente += grad_local * v.gradiente
 
-    def backward(self):
-        topo = []
-        visited = set()
-        def build_topo(v):
-            if v not in visited:
-                visited.add(v)
-                for child in v._children:
-                    build_topo(child)
-                topo.append(v)
-        build_topo(self)
-        self.grad = 1
-        for v in reversed(topo):
-            for child, local_grad in zip(v._children, v._local_grads):
-                child.grad += local_grad * v.grad
+# Arrancar los parámetros para almacenar el conocimiento del modelo
+c_capas = 1                             # Cantidad de capas
+d_incrustacion = 16                     # Dimensión de incrustación
+t_bloque = 16                           # Longitud máxima de secuencia
+c_cabezas = 4                           # Cantidad de cabezas de atención
+d_cabeza = d_incrustacion // c_cabezas  # Dimensión derivada de cada cabeza
+matriz = lambda salidas, entradas, desv=0.08: [[Valor(random.gauss(0, desv)) for _ in range(entradas)] for _ in range(salidas)]
+estado_modelo = {'incrustacion_fichas': matriz(long_vocab, d_incrustacion), 'incrustacion_posicion': matriz(t_bloque, d_incrustacion), 'cabeza_salida': matriz(long_vocab, d_incrustacion)}
+for i in range(c_capas):
+    estado_modelo[f'capa{i}.atencion_wq'] = matriz(d_incrustacion, d_incrustacion)
+    estado_modelo[f'capa{i}.atencion_wk'] = matriz(d_incrustacion, d_incrustacion)
+    estado_modelo[f'capa{i}.atencion_wv'] = matriz(d_incrustacion, d_incrustacion)
+    estado_modelo[f'capa{i}.atencion_wo'] = matriz(d_incrustacion, d_incrustacion)
+    estado_modelo[f'capa{i}.pmc_fc1'] = matriz(4 * d_incrustacion, d_incrustacion)
+    estado_modelo[f'capa{i}.pmc_fc2'] = matriz(d_incrustacion, 4 * d_incrustacion)
+parametros = [pa for matriz in estado_modelo.values() for fila in matriz for pa in fila] # Aplanar los parámetros en una sola lista[Valor]
+print(f"cantidad de parámetros: {len(parametros)}")
 
-# Initialize the parameters, to store the knowledge of the model
-n_layer = 1     # depth of the transformer neural network (number of layers)
-n_embd = 16     # width of the network (embedding dimension)
-block_size = 16 # maximum context length of the attention window (note: the longest name is 15 characters)
-n_head = 4      # number of attention heads
-head_dim = n_embd // n_head # derived dimension of each head
-matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
-state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
-for i in range(n_layer):
-    state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.attn_wv'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
-    state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
-params = [p for mat in state_dict.values() for row in mat for p in row] # flatten params into a single list[Value]
-print(f"num params: {len(params)}")
-
-# Define the model architecture: a function mapping tokens and parameters to logits over what comes next
-# Follow GPT-2, blessed among the GPTs, with minor differences: layernorm -> rmsnorm, no biases, GeLU -> ReLU
-def linear(x, w):
-    return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
+# Definir la arquitectura del modelo: función que relaciona fichas y parámetros con logits (predicciones) sobre la próxima ficha
+# Replica GPT-2, con diferencias menores: normalización RCM en lugar de normalización por capas, sin sesgos, ReLU en lugar de GeLU
+def lineal(entrada, pesos):
+    return [sum(peso_i * x_i for peso_i, x_i in zip(fila_pesos, entrada)) for fila_pesos in pesos]
 
 def softmax(logits):
-    max_val = max(val.data for val in logits)
-    exps = [(val - max_val).exp() for val in logits]
-    total = sum(exps)
-    return [e / total for e in exps]
+    valor_maximo = max(valor.dato for valor in logits)
+    exponenciales = [(valor - valor_maximo).exp() for valor in logits]
+    total = sum(exponenciales)
+    return [e / total for e in exponenciales]
 
-def rmsnorm(x):
-    ms = sum(xi * xi for xi in x) / len(x)
-    scale = (ms + 1e-5) ** -0.5
-    return [xi * scale for xi in x]
+def normar_rcm(x):
+    media_cuadratica = sum(x_i * x_i for x_i in x) / len(x)
+    escala = (media_cuadratica + 1e-5) ** -0.5
+    return [x_i * escala for x_i in x] # Nota: no es redundante debido a la retropropagación mediante la conexión residual
 
-def gpt(token_id, pos_id, keys, values):
-    tok_emb = state_dict['wte'][token_id] # token embedding
-    pos_emb = state_dict['wpe'][pos_id] # position embedding
-    x = [t + p for t, p in zip(tok_emb, pos_emb)] # joint token and position embedding
-    x = rmsnorm(x) # note: not redundant due to backward pass via the residual connection
+def gpt(id_ficha, id_posicion, claves, valores):
+    incrustacion_ficha = estado_modelo['incrustacion_fichas'][id_ficha] # Incrustación de ficha
+    incrustacion_posicion = estado_modelo['incrustacion_posicion'][id_posicion] # Incrustación de posición
+    x = [f + p for f, p in zip(incrustacion_ficha, incrustacion_posicion)] # Combinar información semántica y posicional
+    x = normar_rcm(x)
 
-    for li in range(n_layer):
-        # 1) Multi-head Attention block
+    for li in range(c_capas):
+        # 1) Bloque de atención multicabeza
         x_residual = x
-        x = rmsnorm(x)
-        q = linear(x, state_dict[f'layer{li}.attn_wq'])
-        k = linear(x, state_dict[f'layer{li}.attn_wk'])
-        v = linear(x, state_dict[f'layer{li}.attn_wv'])
-        keys[li].append(k)
-        values[li].append(v)
-        x_attn = []
-        for h in range(n_head):
-            hs = h * head_dim
-            q_h = q[hs:hs+head_dim]
-            k_h = [ki[hs:hs+head_dim] for ki in keys[li]]
-            v_h = [vi[hs:hs+head_dim] for vi in values[li]]
-            attn_logits = [sum(q_h[j] * k_h[t][j] for j in range(head_dim)) / head_dim**0.5 for t in range(len(k_h))]
-            attn_weights = softmax(attn_logits)
-            head_out = [sum(attn_weights[t] * v_h[t][j] for t in range(len(v_h))) for j in range(head_dim)]
-            x_attn.extend(head_out)
-        x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
+        x = normar_rcm(x)
+        q = lineal(x, estado_modelo[f'capa{li}.atencion_wq'])
+        k = lineal(x, estado_modelo[f'capa{li}.atencion_wk'])
+        v = lineal(x, estado_modelo[f'capa{li}.atencion_wv'])
+        claves[li].append(k)
+        valores[li].append(v)
+        x_atencion = []
+        for h in range(c_cabezas):
+            inicio = h * d_cabeza
+            q_h = q[inicio:inicio+d_cabeza]
+            k_h = [ki[inicio:inicio+d_cabeza] for ki in claves[li]]
+            v_h = [vi[inicio:inicio+d_cabeza] for vi in valores[li]]
+            logits_atencion = [sum(q_h[j] * k_h[t][j] for j in range(d_cabeza)) / d_cabeza**0.5 for t in range(len(k_h))]
+            pesos_atencion = softmax(logits_atencion)
+            salida_cabeza = [sum(pesos_atencion[t] * v_h[t][j] for t in range(len(v_h))) for j in range(d_cabeza)]
+            x_atencion.extend(salida_cabeza)
+        x = lineal(x_atencion, estado_modelo[f'capa{li}.atencion_wo'])
         x = [a + b for a, b in zip(x, x_residual)]
-        # 2) MLP block
+        # 2) Bloque PMC (Perceptrón Multicapa)
         x_residual = x
-        x = rmsnorm(x)
-        x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
+        x = normar_rcm(x)
+        x = lineal(x, estado_modelo[f'capa{li}.pmc_fc1'])
         x = [xi.relu() for xi in x]
-        x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
+        x = lineal(x, estado_modelo[f'capa{li}.pmc_fc2'])
         x = [a + b for a, b in zip(x, x_residual)]
 
-    logits = linear(x, state_dict['lm_head'])
+    logits = lineal(x, estado_modelo['cabeza_salida'])
     return logits
 
-# Let there be Adam, the blessed optimizer and its buffers
-learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
-m = [0.0] * len(params) # first moment buffer
-v = [0.0] * len(params) # second moment buffer
+# Configurar optimizador Adam y su memoria
+tasa_aprendizaje, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
+momento1 = [0.0] * len(parametros) # Memoria de primer momento
+momento2 = [0.0] * len(parametros) # Memoria de segundo momento
 
-# Repeat in sequence
-num_steps = 1000 # number of training steps
-for step in range(num_steps):
-
-    # Take single document, tokenize it, surround it with BOS special token on both sides
-    doc = docs[step % len(docs)]
-    tokens = [BOS] + [uchars.index(ch) for ch in doc] + [BOS]
-    n = min(block_size, len(tokens) - 1)
-
-    # Forward the token sequence through the model, building up the computation graph all the way to the loss
-    keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
-    losses = []
+# Bucle de entrenamiento
+c_pasos = 1000 # Cantidad de pasos de entrenamiento
+for paso in range(c_pasos):
+    # Tomar un documento, transformarlo en ficha y rodearlo con la ficha especial PDS en ambos lados
+    doc = documentos[paso % len(documentos)]
+    fichas = [PDS] + [caracteres_unicos.index(ch) for ch in doc] + [PDS]
+    n = min(t_bloque, len(fichas) - 1)
+    # Propagar la secuencia de fichas a través del modelo, construyendo el grafo de cómputo hasta la pérdida
+    claves, valores = [[] for _ in range(c_capas)], [[] for _ in range(c_capas)]
+    perdidas = []
     for pos_id in range(n):
-        token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
-        logits = gpt(token_id, pos_id, keys, values)
-        probs = softmax(logits)
-        loss_t = -probs[target_id].log()
-        losses.append(loss_t)
-    loss = (1 / n) * sum(losses) # final average loss over the document sequence. May yours be low.
+        ficha_actual, ficha_objetivo = fichas[pos_id], fichas[pos_id + 1]
+        logits = gpt(ficha_actual, pos_id, claves, valores)
+        probabilidades = softmax(logits)
+        perdida_pos = -probabilidades[ficha_objetivo].log()
+        perdidas.append(perdida_pos)
+    perdida = (1 / n) * sum(perdidas) # Pérdida promedio sobre la secuencia
+    # Retropropagar la pérdida, calculando los gradientes con respecto a todos los parámetros
+    perdida.propagar()
 
-    # Backward the loss, calculating the gradients with respect to all model parameters
-    loss.backward()
+    # Actualización del optimizador Adam: actualiza los parámetros del modelo según los gradientes correspondientes
+    tasa_actual = tasa_aprendizaje * (1 - paso / c_pasos) # Decaimiento lineal de la tasa de aprendizaje
+    for i, p in enumerate(parametros):
+        momento1[i] = beta1 * momento1[i] + (1 - beta1) * p.gradiente
+        momento2[i] = beta2 * momento2[i] + (1 - beta2) * p.gradiente ** 2
+        momento1_corregido = momento1[i] / (1 - beta1 ** (paso + 1))
+        momento2_corregido = momento2[i] / (1 - beta2 ** (paso + 1))
+        p.dato -= tasa_actual * momento1_corregido / (momento2_corregido ** 0.5 + eps_adam)
+        p.gradiente = 0
+    print(f"paso {paso+1:4d} / {c_pasos:4d} | pérdida {perdida.dato:.4f}", end="\r")
 
-    # Adam optimizer update: update the model parameters based on the corresponding gradients
-    lr_t = learning_rate * (1 - step / num_steps) # linear learning rate decay
-    for i, p in enumerate(params):
-        m[i] = beta1 * m[i] + (1 - beta1) * p.grad
-        v[i] = beta2 * v[i] + (1 - beta2) * p.grad ** 2
-        m_hat = m[i] / (1 - beta1 ** (step + 1))
-        v_hat = v[i] / (1 - beta2 ** (step + 1))
-        p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
-        p.grad = 0
-
-    print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.data:.4f}", end='\r')
-
-# Inference: may the model babble back to us
-temperature = 0.5 # in (0, 1], control the "creativity" of generated text, low to high
-print("\n--- inference (new, hallucinated names) ---")
-for sample_idx in range(20):
-    keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
-    token_id = BOS
-    sample = []
-    for pos_id in range(block_size):
-        logits = gpt(token_id, pos_id, keys, values)
-        probs = softmax([l / temperature for l in logits])
-        token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
-        if token_id == BOS:
+# Inferencia: generar texto nuevo
+temperatura = 0.5 # En (0, 1], controla la «creatividad» del texto generado, de menor a mayor
+print("\n--- inferencia (nuevos nombres alucinados) ---")
+for ind_muestra in range(20):
+    claves, valores = [[] for _ in range(c_capas)], [[] for _ in range(c_capas)]
+    ficha_actual = PDS
+    muestra = []
+    for pos_id in range(t_bloque):
+        logits = gpt(ficha_actual, pos_id, claves, valores)
+        probabilidades = softmax([l / temperatura for l in logits])
+        ficha_actual = random.choices(range(long_vocab), weights=[p.dato for p in probabilidades])[0]
+        if ficha_actual == PDS:
             break
-        sample.append(uchars[token_id])
-    print(f"sample {sample_idx+1:2d}: {''.join(sample)}")
+        muestra.append(caracteres_unicos[ficha_actual])
+    print(f"muestra {ind_muestra+1:2d}: {''.join(muestra)}")
